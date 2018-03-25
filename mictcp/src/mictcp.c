@@ -69,7 +69,7 @@ int mic_tcp_socket(start_mode sm)
    
 	
    printf("[MIC-TCP] Appel de la fonction: ");  printf(__FUNCTION__); printf("\n");
-   result = initialize_components(sm); /* Appel obligatoire *//*
+   result = initialize_components(sm);  Appel obligatoire 
    set_loss_rate(0);
 
    return result;*/
@@ -188,9 +188,10 @@ int mic_tcp_recv (int socket, char* mesg, int max_mesg_size)
 
 	mic_tcp_payload content;
 
-	content.data = malloc(sizeof(char)*20);
-
-	if(app_buffer_get(content) == -1)
+	content.data = malloc(sizeof(char)*max_mesg_size);
+	content.size = app_buffer_get(content);
+	
+	if(content.size == -1)
 	{
 		return -1;
 	}
