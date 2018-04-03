@@ -2,15 +2,16 @@
 #include <api/mictcp_core.h>
 
 #define __TCPMIC_BUFSIZE 32
+#define __TCPMIC_MAXWAITLOOPSIZE 1024
 
-int __TCP_MIC_current = 0;
+int __TCP_MIC_current = 0; // actual buffer size
 
 mic_tcp_sock __MIC_TCP_sock_buffer[__TCPMIC_BUFSIZE];
 
 int mic_tcp_first_available_fd(void)
 {
 	int i, ret = 0;
-	for(i=0;i<__TCPMIC_BUFSIZE;++i)
+	for(i=0;i<__TCP_MIC_current;++i)
 	{
 		if(__MIC_TCP_sock_buffer[i].fd == ret)
 		{
@@ -21,6 +22,20 @@ int mic_tcp_first_available_fd(void)
 	return ret;
 }
 
+int mic_tcp_first_available_for_ack_from_addr(mic_tcp_sock_addr addr)
+{ // get the first socket that is waiting for an ack on addr
+	int i;
+	for(i=0;i<__TCP_MIC_current;++i)
+	{
+		printf("%.*s :::: %.*s\n", sizeof(mic_tcp_sock_addr), &__MIC_TCP_sock_buffer[i].addr, sizeof(mic_tcp_sock_addr),  &addr);
+		if((memcmp(&__MIC_TCP_sock_buffer[i].addr, &addr, sizeof(mic_tcp_sock_addr))) && (__MIC_TCP_sock_buffer[i].state == WAIT_FOR_ACK))
+		{
+			return i;
+		}
+	}
+	return -1;
+}
+
 /*
 mic_tcp_get_id_from_fd
 retour : -1 si erreur, id dans __MIC_TCP_sock_buffer sinon
@@ -28,7 +43,7 @@ retour : -1 si erreur, id dans __MIC_TCP_sock_buffer sinon
 int mic_tcp_get_id_from_fd(int fd)
 {
 	int i;
-	for(i=0;i<__TCPMIC_BUFSIZE;++i)
+	for(i=0;i<__TCP_MIC_current;++i)
 	{
 		if(__MIC_TCP_sock_buffer[i].fd == fd)
 		{
@@ -88,10 +103,13 @@ int mic_tcp_socket(start_mode sm)
 		return -1;
 	}
 
-	__MIC_TCP_sock_buffer[__TCP_MIC_current].state = sm;
+	__MIC_TCP_sock_buffer[__TCP_MIC_current].state = IDLE;
 	__MIC_TCP_sock_buffer[__TCP_MIC_current].fd =  mic_tcp_first_available_fd();
+	__MIC_TCP_sock_buffer[__TCP_MIC_current].n_seq =  0;
 
-	return __MIC_TCP_sock_buffer[__TCP_MIC_current].fd;
+
+	++__TCP_MIC_current;
+	return __MIC_TCP_sock_buffer[__TCP_MIC_current-1].fd;
 }
 
 /*
@@ -108,7 +126,13 @@ int mic_tcp_bind(int socket, mic_tcp_sock_addr addr)
 	{
 		return -1;
 	}
+	
+	if(__MIC_TCP_sock_buffer[id].state != IDLE)
+	{
+		return -1;
+	}
 
+	__MIC_TCP_sock_buffer[id].state = BOUND;
 	__MIC_TCP_sock_buffer[id].addr = addr;
 
 
@@ -130,13 +154,15 @@ int mic_tcp_accept(int socket, mic_tcp_sock_addr* addr)
 		return -1;
 	}
 
-	/*if(__MIC_TCP_sock_buffer[id].state != IDLE)
+	if(__MIC_TCP_sock_buffer[id].state != BOUND)
 	{
 		return -1;
 	}
-	__MIC_TCP_sock_buffer[id].state = WAIT_CONNEXION;*/
+
+	__MIC_TCP_sock_buffer[id].state = WAIT_CONNEXION;
 	
 	//completer
+	__MIC_TCP_sock_buffer[id].state = CONNECTED;
 	
 	return 0;
 }
@@ -166,13 +192,52 @@ int mic_tcp_send (int mic_sock, char* mesg, int mesg_size)
 		return -1;
 	}
 
+	int i;
+	for(i=0;i<__TCPMIC_MAXWAITLOOPSIZE;++i)
+	{
+		if(__MIC_TCP_sock_buffer[id].state != CONNECTED)
+		{ // waiting the socket to be available
+			break;
+		}
+		usleep(500); // wait 500 usec (arbitrary value)
+	}
+	if(i==__TCPMIC_MAXWAITLOOPSIZE)
+	{ // if the socket doesn't come to the connected state in less than MAXWAITLOOPSIZE iterations : error
+		return -1;
+	}
+
 	mic_tcp_pdu pdu;
 
 	pdu.header = mic_tcp_build_header(0, 0/* inutile a priori */, __MIC_TCP_sock_buffer[id].n_seq, 1512, __MIC_TCP_sock_buffer[id].addr.port);
 	pdu.payload.data = mesg;
 	pdu.payload.size = mesg_size;
 
-	return IP_send(pdu, __MIC_TCP_sock_buffer[id].addr);
+	int ret;
+	mic_tcp_pdu receivedPDU;
+	
+	/*do // version asynchrone
+	{
+		ret = IP_send(pdu, __MIC_TCP_sock_buffer[id].addr);
+		if(ret == -1)
+		{ // if IP_send error
+			return -1;
+		}
+	}while(IP_recv(&receivedPDU, &__MIC_TCP_sock_buffer[id].addr, 300) == -1);*/
+	
+	// version segpa :
+	i=0;
+	do
+	{
+		if(i%50000 == 0)
+		{
+			ret = IP_send(pdu, __MIC_TCP_sock_buffer[id].addr);
+			__MIC_TCP_sock_buffer[id].state = WAIT_FOR_ACK;
+		}
+		usleep(20);
+		++i;
+	}while(__MIC_TCP_sock_buffer[id].state == WAIT_FOR_ACK);
+
+	return ret;
 }
 
 /*
@@ -185,25 +250,45 @@ int mic_tcp_recv (int socket, char* mesg, int max_mesg_size)
 {
 
 	printf("[MIC-TCP] Appel de la fonction: "); printf(__FUNCTION__); printf("\n");
-
-	mic_tcp_payload content;
-
-	content.data = malloc(sizeof(char)*max_mesg_size);
-	content.size = app_buffer_get(content);
 	
-	if(content.size == -1)
+	int id = mic_tcp_get_id_from_fd(socket);
+
+	if(id == -1)
 	{
 		return -1;
 	}
 
-	if(content.size >= max_mesg_size)
+	mic_tcp_payload content;
+	switch(__MIC_TCP_sock_buffer[id].state)
 	{
-		content.size = max_mesg_size;
-	}
-    
-	strncpy(mesg, content.data, content.size);
+		case CONNECTED:
+			content.data = malloc(sizeof(char)*max_mesg_size);
+			content.size = app_buffer_get(content);
+	
+			if(content.size == -1)
+			{ // if there was an error retrieving from buffer
+				free(content.data);
+				return -1;
+			}
 
-	return content.size;
+			if(content.size >= max_mesg_size)
+			{ // if the received PDU is larger than the max accepted size
+				content.size = max_mesg_size;
+			}
+		
+			strncpy(mesg, content.data, content.size);
+
+			return content.size;
+			break;
+		case WAIT_FOR_ACK:
+			printf("coucou\n");
+			
+			
+			break;
+		default:
+			return -1; // not a valid state
+			break;
+	}
 }
 
 /*
@@ -237,9 +322,32 @@ void process_received_PDU(mic_tcp_pdu pdu, mic_tcp_sock_addr addr)
 		pdu_size = IP_recv(&received_pdu,&addr_emetteur, timeout);printf("0\n");
 	}*/
 
+	int id_socket = mic_tcp_first_available_for_ack_from_addr(addr);
+	if(id_socket == -1)
+	{printf("personne n'ecoute :(\n");
+		// no socket can get the PDU
+		//return;
+		id_socket = 0;
+	}
+	if(pdu.header.ack && pdu.header.ack_num == __MIC_TCP_sock_buffer[id_socket].n_seq)
+	{
+		__MIC_TCP_sock_buffer[id_socket].state = CONNECTED;
+		__MIC_TCP_sock_buffer[id_socket].n_seq ^= 1;
+	}
+
 	if(pdu.payload.data > 0)
 	{
 		app_buffer_put(pdu.payload);
+	}
+	else if(!pdu.header.ack)
+	{
+		mic_tcp_header ack_header = mic_tcp_build_header(TCPMIC_ACK, pdu.header.ack_num, 0/*unused*/, 1512, __MIC_TCP_sock_buffer[id_socket].addr.port);
+		mic_tcp_pdu ack_pdu;
+		ack_pdu.header = ack_header;
+		ack_pdu.payload.data = NULL;
+		ack_pdu.payload.size = 0;
+		
+		IP_send(ack_pdu, addr);
 	}
 }
 
