@@ -27,10 +27,16 @@ int mic_tcp_first_available_for_ack_from_addr(mic_tcp_sock_addr addr)
 	int i;
 	for(i=0;i<__TCP_MIC_current;++i)
 	{
-		printf("%.*s :::: %.*s\n", sizeof(mic_tcp_sock_addr), &__MIC_TCP_sock_buffer[i].addr, sizeof(mic_tcp_sock_addr),  &addr);
-		if((memcmp(&__MIC_TCP_sock_buffer[i].addr, &addr, sizeof(mic_tcp_sock_addr))) && (__MIC_TCP_sock_buffer[i].state == WAIT_FOR_ACK))
+		//printf("%.*s :::: %.*s\n", sizeof(mic_tcp_sock_addr), &__MIC_TCP_sock_buffer[i].addr, sizeof(mic_tcp_sock_addr),  &addr);
+		//if((memcmp(&__MIC_TCP_sock_buffer[i].addr, &addr, sizeof(mic_tcp_sock_addr))) && (__MIC_TCP_sock_buffer[i].state == WAIT_FOR_ACK))
+		if((__MIC_TCP_sock_buffer[i].addr.port == addr.port) && (__MIC_TCP_sock_buffer[i].state == CONNECTED))
 		{
 			return i;
+		}
+		else
+		{
+			printf("%d != %d\n", __MIC_TCP_sock_buffer[i].addr.port, addr.port);
+			printf("or %d pas bon etat\n\n", __MIC_TCP_sock_buffer[i].state);
 		}
 	}
 	return -1;
@@ -174,6 +180,21 @@ int mic_tcp_accept(int socket, mic_tcp_sock_addr* addr)
 int mic_tcp_connect(int socket, mic_tcp_sock_addr addr)
 {
     printf("[MIC-TCP] Appel de la fonction: ");  printf(__FUNCTION__); printf("\n");
+    
+    int id = mic_tcp_get_id_from_fd(socket);
+
+	if(id == -1)
+	{
+		return -1;
+	}
+
+	if(__MIC_TCP_sock_buffer[id].state != IDLE)
+	{
+		return -1;
+	}
+
+	__MIC_TCP_sock_buffer[id].state = CONNECTED;
+
     return 0;
 }
 
@@ -188,14 +209,14 @@ int mic_tcp_send (int mic_sock, char* mesg, int mesg_size)
 	int id = mic_tcp_get_id_from_fd(mic_sock);
 
 	if(id == -1)
-	{
+	{printf("erreur socket not found\n");
 		return -1;
 	}
 
 	int i;
 	for(i=0;i<__TCPMIC_MAXWAITLOOPSIZE;++i)
-	{
-		if(__MIC_TCP_sock_buffer[id].state != CONNECTED)
+	{//printf("current : %d\n", __MIC_TCP_sock_buffer[id].state);
+		if(__MIC_TCP_sock_buffer[id].state == CONNECTED)
 		{ // waiting the socket to be available
 			break;
 		}
@@ -205,17 +226,19 @@ int mic_tcp_send (int mic_sock, char* mesg, int mesg_size)
 	{ // if the socket doesn't come to the connected state in less than MAXWAITLOOPSIZE iterations : error
 		return -1;
 	}
+	
+	printf("proceeding with state %d\n", __MIC_TCP_sock_buffer[id].state);
 
 	mic_tcp_pdu pdu;
 
-	pdu.header = mic_tcp_build_header(0, 0/* inutile a priori */, __MIC_TCP_sock_buffer[id].n_seq, 1512, __MIC_TCP_sock_buffer[id].addr.port);
+	pdu.header = mic_tcp_build_header(0, 0/* inutile a priori */, __MIC_TCP_sock_buffer[id].n_seq, 1234, __MIC_TCP_sock_buffer[id].addr.port);
 	pdu.payload.data = mesg;
 	pdu.payload.size = mesg_size;
 
 	int ret;
-	mic_tcp_pdu receivedPDU;
+	/*mic_tcp_pdu receivedPDU;
 	
-	/*do // version asynchrone
+	do // version asynchrone
 	{
 		ret = IP_send(pdu, __MIC_TCP_sock_buffer[id].addr);
 		if(ret == -1)
@@ -223,19 +246,56 @@ int mic_tcp_send (int mic_sock, char* mesg, int mesg_size)
 			return -1;
 		}
 	}while(IP_recv(&receivedPDU, &__MIC_TCP_sock_buffer[id].addr, 300) == -1);*/
-	
-	// version segpa :
+
+
+
+
+	mic_tcp_pdu pduAck;
+	pduAck.payload.size = 0;
+	mic_tcp_sock_addr addr;
 	i=0;
 	do
 	{
-		if(i%50000 == 0)
+		printf("envoi du message avec numéro de séquence : %d \n", __MIC_TCP_sock_buffer[id].n_seq);
+		ret = IP_send(pdu, __MIC_TCP_sock_buffer[id].addr);
+		if(ret == -1)
 		{
-			ret = IP_send(pdu, __MIC_TCP_sock_buffer[id].addr);
-			__MIC_TCP_sock_buffer[id].state = WAIT_FOR_ACK;
+			printf("unable to send message");
+			exit(1);
 		}
-		usleep(20);
+		
+		__MIC_TCP_sock_buffer[id].state = WAIT_FOR_ACK;
+
+		ret = IP_recv(&pduAck, &addr, 2000);
+		if(ret != -1)
+		{
+			if(pduAck.header.ack && (pduAck.header.ack_num == __MIC_TCP_sock_buffer[id].n_seq))
+			{printf("acquittement recu !\n");
+				break;
+			}
+			else
+			{
+				printf("pb dans l'acquittement\n");
+			}
+		}
+		else
+		{
+			printf("rien recu : %d\n", ret);
+			usleep(2000000);
+		}
+
 		++i;
 	}while(__MIC_TCP_sock_buffer[id].state == WAIT_FOR_ACK);
+	
+	__MIC_TCP_sock_buffer[id].state = CONNECTED;
+	if(__MIC_TCP_sock_buffer[id].n_seq == 0)
+	{
+		__MIC_TCP_sock_buffer[id].n_seq = 1;
+	}
+	else
+	{
+		__MIC_TCP_sock_buffer[id].n_seq = 0;
+	}
 
 	return ret;
 }
@@ -263,25 +323,29 @@ int mic_tcp_recv (int socket, char* mesg, int max_mesg_size)
 	{
 		case CONNECTED:
 			content.data = malloc(sizeof(char)*max_mesg_size);
+			content.size = max_mesg_size;
 			content.size = app_buffer_get(content);
 	
 			if(content.size == -1)
 			{ // if there was an error retrieving from buffer
+				printf("error retrieving from buffer");
 				free(content.data);
 				return -1;
 			}
 
-			if(content.size >= max_mesg_size)
+			/*if(content.size >= max_mesg_size)
 			{ // if the received PDU is larger than the max accepted size
 				content.size = max_mesg_size;
-			}
+			}*/
 		
 			strncpy(mesg, content.data, content.size);
+			
+			free(content.data);
 
 			return content.size;
 			break;
 		case WAIT_FOR_ACK:
-			printf("coucou\n");
+			printf("waiting for ack !\n");
 			
 			
 			break;
@@ -324,30 +388,38 @@ void process_received_PDU(mic_tcp_pdu pdu, mic_tcp_sock_addr addr)
 
 	int id_socket = mic_tcp_first_available_for_ack_from_addr(addr);
 	if(id_socket == -1)
-	{printf("personne n'ecoute :(\n");
+	{printf("personne n'ecoute\n");
 		// no socket can get the PDU
 		//return;
 		id_socket = 0;
 	}
-	if(pdu.header.ack && pdu.header.ack_num == __MIC_TCP_sock_buffer[id_socket].n_seq)
-	{
-		__MIC_TCP_sock_buffer[id_socket].state = CONNECTED;
-		__MIC_TCP_sock_buffer[id_socket].n_seq ^= 1;
-	}
 
-	if(pdu.payload.data > 0)
+	if(pdu.header.ack != 1)
 	{
-		app_buffer_put(pdu.payload);
-	}
-	else if(!pdu.header.ack)
-	{
-		mic_tcp_header ack_header = mic_tcp_build_header(TCPMIC_ACK, pdu.header.ack_num, 0/*unused*/, 1512, __MIC_TCP_sock_buffer[id_socket].addr.port);
+		mic_tcp_header ack_header = mic_tcp_build_header(TCPMIC_ACK, pdu.header.seq_num, 0/*unused*/, __MIC_TCP_sock_buffer[id_socket].addr.port, __MIC_TCP_sock_buffer[id_socket].addr.port);
 		mic_tcp_pdu ack_pdu;
 		ack_pdu.header = ack_header;
 		ack_pdu.payload.data = NULL;
 		ack_pdu.payload.size = 0;
-		
+
+		printf("envoi de l'acquittement, on acquitte %d \n", __MIC_TCP_sock_buffer[id_socket].n_seq);
 		IP_send(ack_pdu, addr);
+
+		if(pdu.payload.data > 0)
+		{
+			if(pdu.header.seq_num == __MIC_TCP_sock_buffer[id_socket].n_seq)
+			{
+				app_buffer_put(pdu.payload);
+				if(__MIC_TCP_sock_buffer[id_socket].n_seq == 0)
+				{
+					__MIC_TCP_sock_buffer[id_socket].n_seq = 1;
+				}
+				else
+				{
+					__MIC_TCP_sock_buffer[id_socket].n_seq = 0;
+				}
+			}
+		}
 	}
 }
 
