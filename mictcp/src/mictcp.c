@@ -8,6 +8,7 @@ int __TCP_MIC_current = 0; // actual buffer size
 
 mic_tcp_sock __MIC_TCP_sock_buffer[__TCPMIC_BUFSIZE];
 
+// Retourne le premier descripteur disponible
 int mic_tcp_first_available_fd(void)
 {
 	int i, ret = 0;
@@ -209,7 +210,8 @@ int mic_tcp_send (int mic_sock, char* mesg, int mesg_size)
 	int id = mic_tcp_get_id_from_fd(mic_sock);
 
 	if(id == -1)
-	{printf("erreur socket not found\n");
+	{	
+		printf("erreur socket not found\n");
 		return -1;
 	}
 
@@ -229,31 +231,20 @@ int mic_tcp_send (int mic_sock, char* mesg, int mesg_size)
 	
 	printf("proceeding with state %d\n", __MIC_TCP_sock_buffer[id].state);
 
-	mic_tcp_pdu pdu;
 
-	pdu.header = mic_tcp_build_header(0, 0/* inutile a priori */, __MIC_TCP_sock_buffer[id].n_seq, 1234, __MIC_TCP_sock_buffer[id].addr.port);
+	
+	// Création du PDU
+	mic_tcp_pdu pdu;
+	pdu.header = mic_tcp_build_header(0, 0/* inutile a priori */, __MIC_TCP_sock_buffer[id].n_seq, __MIC_TCP_sock_buffer[id].addr.port, __MIC_TCP_sock_buffer[id].addr.port);
 	pdu.payload.data = mesg;
 	pdu.payload.size = mesg_size;
 
 	int ret;
-	/*mic_tcp_pdu receivedPDU;
-	
-	do // version asynchrone
-	{
-		ret = IP_send(pdu, __MIC_TCP_sock_buffer[id].addr);
-		if(ret == -1)
-		{ // if IP_send error
-			return -1;
-		}
-	}while(IP_recv(&receivedPDU, &__MIC_TCP_sock_buffer[id].addr, 300) == -1);*/
-
-
-
-
 	mic_tcp_pdu pduAck;
 	pduAck.payload.size = 0;
 	mic_tcp_sock_addr addr;
-	i=0;
+
+
 	do
 	{
 		printf("envoi du message avec numéro de séquence : %d \n", __MIC_TCP_sock_buffer[id].n_seq);
@@ -264,13 +255,17 @@ int mic_tcp_send (int mic_sock, char* mesg, int mesg_size)
 			exit(1);
 		}
 		
+		// Le message est envoyé --> On attend acquittement
 		__MIC_TCP_sock_buffer[id].state = WAIT_FOR_ACK;
 
+
+		// On utilise le timer de IP_recv
 		ret = IP_recv(&pduAck, &addr, 2000);
 		if(ret != -1)
 		{
 			if(pduAck.header.ack && (pduAck.header.ack_num == __MIC_TCP_sock_buffer[id].n_seq))
-			{printf("acquittement recu !\n");
+			{	
+				printf("acquittement recu !\n");
 				break;
 			}
 			else
@@ -281,10 +276,9 @@ int mic_tcp_send (int mic_sock, char* mesg, int mesg_size)
 		else
 		{
 			printf("rien recu : %d\n", ret);
-			usleep(2000000);
 		}
 
-		++i;
+
 	}while(__MIC_TCP_sock_buffer[id].state == WAIT_FOR_ACK);
 	
 	__MIC_TCP_sock_buffer[id].state = CONNECTED;
@@ -332,23 +326,19 @@ int mic_tcp_recv (int socket, char* mesg, int max_mesg_size)
 				free(content.data);
 				return -1;
 			}
-
-			/*if(content.size >= max_mesg_size)
-			{ // if the received PDU is larger than the max accepted size
-				content.size = max_mesg_size;
-			}*/
 		
 			strncpy(mesg, content.data, content.size);
-			
 			free(content.data);
 
 			return content.size;
 			break;
+
 		case WAIT_FOR_ACK:
 			printf("waiting for ack !\n");
-			
+			return 0;
 			
 			break;
+
 		default:
 			return -1; // not a valid state
 			break;
@@ -376,25 +366,18 @@ void process_received_PDU(mic_tcp_pdu pdu, mic_tcp_sock_addr addr)
 {
 	printf("[MIC-TCP] Appel de la fonction: "); printf(__FUNCTION__); printf("\n");
 	
-	mic_tcp_pdu received_pdu;
-	mic_tcp_sock_addr addr_emetteur;
-	unsigned long timeout = 500; // En ms
-	int pdu_size;
-
-	/*while(pdu_size <= 0)
-	{
-		pdu_size = IP_recv(&received_pdu,&addr_emetteur, timeout);printf("0\n");
-	}*/
 
 	int id_socket = mic_tcp_first_available_for_ack_from_addr(addr);
+
 	if(id_socket == -1)
-	{printf("personne n'ecoute\n");
+	{
+		printf("personne n'ecoute\n");
 		// no socket can get the PDU
 		//return;
 		id_socket = 0;
 	}
 
-	if(pdu.header.ack != 1)
+	if(pdu.header.ack != 1) // if it is not a ack pdu
 	{
 		mic_tcp_header ack_header = mic_tcp_build_header(TCPMIC_ACK, pdu.header.seq_num, 0/*unused*/, __MIC_TCP_sock_buffer[id_socket].addr.port, __MIC_TCP_sock_buffer[id_socket].addr.port);
 		mic_tcp_pdu ack_pdu;
@@ -402,11 +385,14 @@ void process_received_PDU(mic_tcp_pdu pdu, mic_tcp_sock_addr addr)
 		ack_pdu.payload.data = NULL;
 		ack_pdu.payload.size = 0;
 
+		// On envoie l'acquittement du PDU reçu avec N°ACK = N°SEQ_reçu
 		printf("envoi de l'acquittement, on acquitte %d \n", __MIC_TCP_sock_buffer[id_socket].n_seq);
 		IP_send(ack_pdu, addr);
 
-		if(pdu.payload.data > 0)
+
+		if(pdu.payload.data > 0) 
 		{
+			// On délivre les datas si les numéros coincident + on met a jour numéro seq
 			if(pdu.header.seq_num == __MIC_TCP_sock_buffer[id_socket].n_seq)
 			{
 				app_buffer_put(pdu.payload);
