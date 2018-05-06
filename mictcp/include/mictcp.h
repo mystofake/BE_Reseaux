@@ -14,6 +14,14 @@
 #include <pthread.h>
 #include <sys/time.h>
 
+#define __TCPMIC_PDURECEIVEDBUFSIZE 256
+#define __TCPMIC_TOLERATED_LOSS 0.0
+#define __TCPMIC_DEFAULT_CLIENT_LOSS_RATE 0.2
+#define __TCPMIC_CLIENT_SEND_SYN_ATTEMPT 3
+#define __TCPMIC_DEFAULT_SERVER_LOSS_RATE 0.2
+
+#define __TCPMIC_WAIT_ACK_TIME 10
+#define __TCPMIC_WAIT_CONNEXION_TICK 100
 
 /*
  * Etats du protocole (les noms des états sont donnés à titre indicatif
@@ -49,6 +57,9 @@ typedef struct mic_tcp_sock
 	protocol_state state; /* état du protocole */
 	mic_tcp_sock_addr addr; /* adresse du socket */
     unsigned char n_seq;
+    int lastReceived[__TCPMIC_PDURECEIVEDBUFSIZE];
+    int lastReceivedSize;
+    int lastReceivedCurrent;
 } mic_tcp_sock;
 
 /*
@@ -103,5 +114,11 @@ int mic_tcp_send (int socket, char* mesg, int mesg_size);
 int mic_tcp_recv (int socket, char* mesg, int max_mesg_size);
 void process_received_PDU(mic_tcp_pdu pdu, mic_tcp_sock_addr addr);
 int mic_tcp_close(int socket);
+
+
+/****************************
+ *       Own function       *
+ ****************************/
+int mic_tcp_get_id_from_fd(int fd);
 
 #endif

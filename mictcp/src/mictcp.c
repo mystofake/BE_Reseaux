@@ -23,6 +23,8 @@ int mic_tcp_first_available_fd(void)
 	return ret;
 }
 
+// behaviour = 1 -> target has to be connected (normal mode)
+// behaviour = 0 -> target can be in any mode (for connect())
 int mic_tcp_first_available_for_ack_from_addr(mic_tcp_sock_addr addr)
 { // get the first socket that is waiting for an ack on addr
 	int i;
@@ -30,7 +32,9 @@ int mic_tcp_first_available_for_ack_from_addr(mic_tcp_sock_addr addr)
 	{
 		//printf("%.*s :::: %.*s\n", sizeof(mic_tcp_sock_addr), &__MIC_TCP_sock_buffer[i].addr, sizeof(mic_tcp_sock_addr),  &addr);
 		//if((memcmp(&__MIC_TCP_sock_buffer[i].addr, &addr, sizeof(mic_tcp_sock_addr))) && (__MIC_TCP_sock_buffer[i].state == WAIT_FOR_ACK))
-		if((__MIC_TCP_sock_buffer[i].addr.port == addr.port) && (__MIC_TCP_sock_buffer[i].state == CONNECTED))
+		
+		// TODO : refaire
+		if(((__MIC_TCP_sock_buffer[i].addr.port == addr.port) || (addr.port == 0)) && ((1) || (__MIC_TCP_sock_buffer[i].state == CONNECTED)))
 		{
 			return i;
 		}
@@ -41,6 +45,48 @@ int mic_tcp_first_available_for_ack_from_addr(mic_tcp_sock_addr addr)
 		}
 	}
 	return -1;
+}
+
+/*
+signals to the socket that a PDU has been received
+	received = 0 -> really received
+	received = 1 -> no ack has been received
+*/
+void mic_tcp_add_pdu_received(int fd, int received)
+{
+	int id = mic_tcp_get_id_from_fd(fd);
+	mic_tcp_sock *socket = &__MIC_TCP_sock_buffer[id];
+
+	if(socket->lastReceivedSize < __TCPMIC_PDURECEIVEDBUFSIZE)
+	{
+		socket->lastReceived[socket->lastReceivedSize] = received;
+		++socket->lastReceivedSize;
+	}
+	else
+	{
+		socket->lastReceived[socket->lastReceivedCurrent] = received;
+		socket->lastReceivedCurrent = (socket->lastReceivedCurrent+1)%__TCPMIC_PDURECEIVEDBUFSIZE;
+	}
+}
+
+/*
+returns the real loss rate for a given socket
+*/
+float mic_tcp_get_effective_loss_rate(int fd)
+{
+	int total = 0;
+	int id = mic_tcp_get_id_from_fd(fd);
+	mic_tcp_sock *socket = &__MIC_TCP_sock_buffer[id];
+	int i;
+	if(socket->lastReceivedSize == 0)
+	{
+		return 1;
+	}
+	for(i=0;i<socket->lastReceivedSize;++i)
+	{
+		total += socket->lastReceived[i];
+	}
+	return (float)total / (float)__TCPMIC_PDURECEIVEDBUFSIZE;
 }
 
 /*
@@ -113,6 +159,8 @@ int mic_tcp_socket(start_mode sm)
 	__MIC_TCP_sock_buffer[__TCP_MIC_current].state = IDLE;
 	__MIC_TCP_sock_buffer[__TCP_MIC_current].fd =  mic_tcp_first_available_fd();
 	__MIC_TCP_sock_buffer[__TCP_MIC_current].n_seq =  0;
+	__MIC_TCP_sock_buffer[__TCP_MIC_current].lastReceivedSize = 0;
+	__MIC_TCP_sock_buffer[__TCP_MIC_current].lastReceivedCurrent = 0;
 
 
 	++__TCP_MIC_current;
@@ -133,7 +181,7 @@ int mic_tcp_bind(int socket, mic_tcp_sock_addr addr)
 	{
 		return -1;
 	}
-	
+
 	if(__MIC_TCP_sock_buffer[id].state != IDLE)
 	{
 		return -1;
@@ -167,7 +215,42 @@ int mic_tcp_accept(int socket, mic_tcp_sock_addr* addr)
 	}
 
 	__MIC_TCP_sock_buffer[id].state = WAIT_CONNEXION;
-	
+
+	mic_tcp_pdu pdu_syn;
+	pdu_syn.payload.size = 0;
+	mic_tcp_sock_addr syn_addr;
+
+	while(IP_recv(&pdu_syn, &syn_addr, __TCPMIC_WAIT_CONNEXION_TICK) == -1);
+
+	// chosen loss rate behaviour
+	float final_loss_rate = __TCPMIC_DEFAULT_SERVER_LOSS_RATE;
+
+	if(pdu_syn.payload.size == sizeof(float))
+	{
+		memcpy(&final_loss_rate, pdu_syn.payload.data, sizeof(float));
+	}
+	// end chosen loss rate behaviour
+
+	mic_tcp_pdu pdu_syn_ack;
+	pdu_syn_ack.header = mic_tcp_build_header(TCPMIC_SYN|TCPMIC_ACK, pdu_syn.header.seq_num, pdu_syn.header.seq_num^1, __MIC_TCP_sock_buffer[id].addr.port, __MIC_TCP_sock_buffer[id].addr.port);
+	pdu_syn_ack.payload.data = (char*)&final_loss_rate;
+	pdu_syn_ack.payload.size = sizeof(float);
+
+	mic_tcp_pdu pdu_ack;
+	pdu_ack.payload.size = 0;
+	mic_tcp_sock_addr ack_addr;
+
+	__MIC_TCP_sock_buffer[id].n_seq = pdu_syn.header.seq_num^1;
+
+	do
+	{
+		if(IP_send(pdu_syn_ack, __MIC_TCP_sock_buffer[id].addr) == -1)
+		{
+			continue;
+		}
+	}while((IP_recv(&pdu_ack, &ack_addr, __TCPMIC_WAIT_CONNEXION_TICK) == -1) || pdu_ack.header.ack != 1);
+	// we send SYN_ACK as long as we don't receive ACK
+
 	//completer
 	__MIC_TCP_sock_buffer[id].state = CONNECTED;
 	
@@ -194,7 +277,73 @@ int mic_tcp_connect(int socket, mic_tcp_sock_addr addr)
 		return -1;
 	}
 
-	__MIC_TCP_sock_buffer[id].state = CONNECTED;
+	int i;
+	float submittedLossRate = __TCPMIC_DEFAULT_CLIENT_LOSS_RATE;
+	float receivedLossRate;
+
+	mic_tcp_pdu pdu_syn;
+	pdu_syn.header = mic_tcp_build_header(TCPMIC_SYN, 0, __MIC_TCP_sock_buffer[id].n_seq, __MIC_TCP_sock_buffer[id].addr.port, __MIC_TCP_sock_buffer[id].addr.port);
+	pdu_syn.payload.data = (char*)(&submittedLossRate);
+	pdu_syn.payload.size = sizeof(float);
+
+	mic_tcp_pdu pdu_ack;
+	pdu_ack.payload.size = 0;
+	
+	int send_ret;
+
+	mic_tcp_pdu pdu_syn_ack;
+	pdu_syn_ack.payload.size = 0;
+	mic_tcp_sock_addr syn_ack_addr;
+
+	for(i=0;i<__TCPMIC_CLIENT_SEND_SYN_ATTEMPT;++i)
+	{
+		send_ret = IP_send(pdu_syn, __MIC_TCP_sock_buffer[id].addr);
+		if(send_ret == -1)
+		{ // if IP_send didn't send
+			continue;
+		}
+
+		if((IP_recv(&pdu_syn_ack, &syn_ack_addr, __TCPMIC_WAIT_ACK_TIME) == -1))
+		{
+			continue;
+		}
+
+		if(pdu_syn_ack.header.ack_num != pdu_syn.header.seq_num || pdu_syn_ack.header.seq_num != (pdu_syn_ack.header.ack_num^1))
+		{ // for some reason we received a bad SYN_ACK
+			continue;
+		}
+
+		__MIC_TCP_sock_buffer[id].n_seq = __MIC_TCP_sock_buffer[id].n_seq^1;
+
+		if(pdu_syn_ack.payload.size == sizeof(float))
+		{ // the server suggests an other loss rate
+			memcpy(&receivedLossRate, pdu_syn_ack.payload.data, sizeof(float));
+		}
+		else
+		{ // if the server doesn't send a loss rate, he implicitly accept ours
+			receivedLossRate = submittedLossRate;
+		}
+
+		if(receivedLossRate != submittedLossRate)
+		{ // the server doesn't agree
+			// by default, the client accepts anything from the server
+			submittedLossRate = receivedLossRate; // we accept the server's loss rate
+		}
+
+		// we build the PDU according to the SYN_ACK we received
+		pdu_ack.header = mic_tcp_build_header(TCPMIC_ACK, pdu_syn_ack.header.seq_num, 0, __MIC_TCP_sock_buffer[id].addr.port, __MIC_TCP_sock_buffer[id].addr.port);
+
+		IP_send(pdu_ack, __MIC_TCP_sock_buffer[id].addr);
+		// we send the ack without any test, since any error would result on the server sending again SYN_ACK and thus the client would ACK back
+
+		__MIC_TCP_sock_buffer[id].state = CONNECTED;
+		break;
+	}
+	
+	if(__MIC_TCP_sock_buffer[id].state != CONNECTED)
+	{ // failed to connect
+		return -1;
+	}
 
     return 0;
 }
@@ -222,7 +371,7 @@ int mic_tcp_send (int mic_sock, char* mesg, int mesg_size)
 		{ // waiting the socket to be available
 			break;
 		}
-		usleep(500); // wait 500 usec (arbitrary value)
+		usleep(5); // wait 500 usec (arbitrary value)
 	}
 	if(i==__TCPMIC_MAXWAITLOOPSIZE)
 	{ // if the socket doesn't come to the connected state in less than MAXWAITLOOPSIZE iterations : error
@@ -260,24 +409,21 @@ int mic_tcp_send (int mic_sock, char* mesg, int mesg_size)
 
 
 		// On utilise le timer de IP_recv
-		ret = IP_recv(&pduAck, &addr, 2000);
+		ret = IP_recv(&pduAck, &addr, __TCPMIC_WAIT_ACK_TIME);
 		if(ret != -1)
 		{
 			if(pduAck.header.ack && (pduAck.header.ack_num == __MIC_TCP_sock_buffer[id].n_seq))
-			{	
-				printf("acquittement recu !\n");
+			{
+				mic_tcp_add_pdu_received(mic_sock, 0);
 				break;
 			}
-			else
-			{
-				printf("pb dans l'acquittement\n");
-			}
-		}
-		else
-		{
-			printf("rien recu : %d\n", ret);
 		}
 
+		if(mic_tcp_get_effective_loss_rate(mic_sock) <= __TCPMIC_TOLERATED_LOSS)
+		{
+			mic_tcp_add_pdu_received(mic_sock, 1);
+			break;
+		}
 
 	}while(__MIC_TCP_sock_buffer[id].state == WAIT_FOR_ACK);
 	
@@ -327,7 +473,7 @@ int mic_tcp_recv (int socket, char* mesg, int max_mesg_size)
 				return -1;
 			}
 		
-			strncpy(mesg, content.data, content.size);
+			memcpy(mesg, content.data, content.size);
 			free(content.data);
 
 			return content.size;
@@ -365,7 +511,6 @@ int mic_tcp_close (int socket)
 void process_received_PDU(mic_tcp_pdu pdu, mic_tcp_sock_addr addr)
 {
 	printf("[MIC-TCP] Appel de la fonction: "); printf(__FUNCTION__); printf("\n");
-	
 
 	int id_socket = mic_tcp_first_available_for_ack_from_addr(addr);
 
@@ -386,11 +531,16 @@ void process_received_PDU(mic_tcp_pdu pdu, mic_tcp_sock_addr addr)
 		ack_pdu.payload.size = 0;
 
 		// On envoie l'acquittement du PDU reçu avec N°ACK = N°SEQ_reçu
-		printf("envoi de l'acquittement, on acquitte %d \n", __MIC_TCP_sock_buffer[id_socket].n_seq);
+		printf("envoi de l'acquittement, on acquitte %d \n", pdu.header.seq_num);
+		printf("on attendait le numero : %d \n", __MIC_TCP_sock_buffer[id_socket].n_seq);
 		IP_send(ack_pdu, addr);
 
 
-		if(pdu.payload.data > 0) 
+		if(pdu.payload.data == 0 || pdu.header.syn == 1) 
+		{
+			printf("Packet vide ou syn recu\n");
+		}
+		else
 		{
 			// On délivre les datas si les numéros coincident + on met a jour numéro seq
 			if(pdu.header.seq_num == __MIC_TCP_sock_buffer[id_socket].n_seq)
@@ -404,6 +554,10 @@ void process_received_PDU(mic_tcp_pdu pdu, mic_tcp_sock_addr addr)
 				{
 					__MIC_TCP_sock_buffer[id_socket].n_seq = 0;
 				}
+			}
+			else
+			{
+				printf("Mauvais numero de sequence\n");
 			}
 		}
 	}
