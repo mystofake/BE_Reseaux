@@ -17,7 +17,7 @@ void print_PDU(mic_tcp_pdu PDU)
 	printf("Port source : %d - Port dest : %d \n", PDU.header.source_port, PDU.header.dest_port);
 	printf("SEQ num : %d - ACK num : %d\n", PDU.header.seq_num, PDU.header.ack_num);
 	if(PDU.payload.size != 0)
-		printf("Contenu : %s - Taille : %d \n", PDU.payload.data, PDU.payload.size);
+		printf("Contenu : %.*s - Taille : %d \n", PDU.payload.size, PDU.payload.data, PDU.payload.size);
 	printf("**********************************\n\n");
 }
 
@@ -143,7 +143,7 @@ mic_tcp_header mic_tcp_build_header(int flag, unsigned int ack_num,
 					unsigned int seq_num, unsigned short source_port, unsigned short dest_port)
 {
 	mic_tcp_header header;
-	
+
 	header.syn = (((flag&TCPMIC_SYN)!=0)?(1):(0));
 	header.ack = (((flag&TCPMIC_ACK)!=0)?(1):(0));
 	header.fin = (((flag&TCPMIC_FIN)!=0)?(1):(0));
@@ -254,6 +254,8 @@ int mic_tcp_accept(int socket, mic_tcp_sock_addr* addr)
 	printf("Reception du SYN\n");
 	print_PDU(pdu_syn);
 
+	__MIC_TCP_sock_buffer[id].state = SYN_RECEIVED;
+	__MIC_TCP_sock_buffer[id].n_seq = pdu_syn.header.seq_num^1;
 
 	// chosen loss rate behaviour
 	float final_loss_rate = __TCPMIC_DEFAULT_SERVER_LOSS_RATE;
@@ -265,7 +267,7 @@ int mic_tcp_accept(int socket, mic_tcp_sock_addr* addr)
 	// end chosen loss rate behaviour
 
 	mic_tcp_pdu pdu_syn_ack;
-	pdu_syn_ack.header = mic_tcp_build_header(TCPMIC_SYN|TCPMIC_ACK, pdu_syn.header.seq_num, pdu_syn.header.seq_num^1, __MIC_TCP_sock_buffer[id].addr.port, __MIC_TCP_sock_buffer[id].addr.port);
+	pdu_syn_ack.header = mic_tcp_build_header(TCPMIC_SYN|TCPMIC_ACK, pdu_syn.header.seq_num, __MIC_TCP_sock_buffer[id].n_seq, __MIC_TCP_sock_buffer[id].addr.port, __MIC_TCP_sock_buffer[id].addr.port);
 	pdu_syn_ack.payload.data = (char*)&final_loss_rate;
 	pdu_syn_ack.payload.size = sizeof(float);
 
@@ -275,8 +277,12 @@ int mic_tcp_accept(int socket, mic_tcp_sock_addr* addr)
 
 	__MIC_TCP_sock_buffer[id].n_seq = pdu_syn.header.seq_num^1;
 
-	do
+	int recv_ret;
+
+	/*do
 	{
+		printf("ack was %d \n", pdu_ack.header.ack);
+
 		if(IP_send(pdu_syn_ack, __MIC_TCP_sock_buffer[id].addr) == -1)
 		{
 			continue;
@@ -284,16 +290,27 @@ int mic_tcp_accept(int socket, mic_tcp_sock_addr* addr)
 
 		printf("ENVOI du SYN-ACK\n");
 		print_PDU(pdu_syn_ack);
+		//sleep(1);
+
+		recv_ret = IP_recv(&pdu_ack, &ack_addr, __TCPMIC_WAIT_CONNEXION_TICK);
+
+		printf("return : %d\n", recv_ret);
+
+	}while(recv_ret == -1 || pdu_ack.header.ack != 1); // while the PDU we receive is not an ack
+	// we send SYN_ACK as long as we don't receive ACK*/
+
+	do
+	{
+		if(IP_send(pdu_syn_ack, __MIC_TCP_sock_buffer[id].addr) == -1)
+		{
+			continue;
+		}
 		sleep(1);
-
-		print_PDU(pdu_ack);
-
-	}while((IP_recv(&pdu_ack, &ack_addr, __TCPMIC_WAIT_CONNEXION_TICK) == -1) && pdu_ack.header.ack != 1);
-	// we send SYN_ACK as long as we don't receive ACK
+	}while(__MIC_TCP_sock_buffer[id].state == WAIT_FOR_ACK);
 
 	printf("Reception du ACK\n");
 	print_SOCKET(__MIC_TCP_sock_buffer[id],1);
-	print_PDU(pdu_ack);
+	//print_PDU(pdu_ack);
 	
 	//completer
 	__MIC_TCP_sock_buffer[id].state = CONNECTED;
@@ -307,9 +324,9 @@ int mic_tcp_accept(int socket, mic_tcp_sock_addr* addr)
  */
 int mic_tcp_connect(int socket, mic_tcp_sock_addr addr)
 {
-    printf("[MIC-TCP] Appel de la fonction: ");  printf(__FUNCTION__); printf("\n");
-    
-    int id = mic_tcp_get_id_from_fd(socket);
+	printf("[MIC-TCP] Appel de la fonction: ");  printf(__FUNCTION__); printf("\n");
+
+	int id = mic_tcp_get_id_from_fd(socket);
 
 	if(id == -1)
 	{
@@ -343,8 +360,10 @@ int mic_tcp_connect(int socket, mic_tcp_sock_addr addr)
 	for(i=0;i<__TCPMIC_CLIENT_SEND_SYN_ATTEMPT;++i)
 	{
 		send_ret = IP_send(pdu_syn, __MIC_TCP_sock_buffer[id].addr);
+		__MIC_TCP_sock_buffer[id].state = SYN_SENT;
+
 		printf("Envoi du Syn\n");
-		print_PDU(pdu_syn);
+		//print_PDU(pdu_syn);
 		if(send_ret == -1)
 		{ // if IP_send didn't send
 			continue;
@@ -361,13 +380,13 @@ int mic_tcp_connect(int socket, mic_tcp_sock_addr addr)
 			continue;
 		}
 
-		printf("Reception du SynACK\n");
-		print_PDU(pdu_syn_ack);
-
-		if(pdu_syn_ack.header.ack_num != pdu_syn.header.seq_num )//|| pdu_syn_ack.header.seq_num != (pdu_syn_ack.header.ack_num^1))
+		if(pdu_syn_ack.header.ack_num != pdu_syn.header.seq_num || pdu_syn_ack.header.seq_num != (pdu_syn_ack.header.ack_num^1))//|| pdu_syn_ack.header.seq_num != (pdu_syn_ack.header.ack_num^1))
 		{ // for some reason we received a bad SYN_ACK
 			continue;
 		}
+
+		printf("Reception du SynACK\n");
+		print_PDU(pdu_syn_ack);
 
 		__MIC_TCP_sock_buffer[id].n_seq = __MIC_TCP_sock_buffer[id].n_seq^1;
 
@@ -387,10 +406,9 @@ int mic_tcp_connect(int socket, mic_tcp_sock_addr addr)
 		}
 
 		// we build the PDU according to the SYN_ACK we received
-		pdu_ack.header = mic_tcp_build_header(TCPMIC_ACK, pdu_syn_ack.header.seq_num, 0, __MIC_TCP_sock_buffer[id].addr.port, __MIC_TCP_sock_buffer[id].addr.port);
-		
+		pdu_ack.header = mic_tcp_build_header(TCPMIC_ACK, pdu_syn_ack.header.seq_num, 0, /*__MIC_TCP_sock_buffer[id].addr.port*/1234, /*__MIC_TCP_sock_buffer[id].addr.port*/1234);
 
-		sleep(5);
+
 		if(IP_send(pdu_ack, __MIC_TCP_sock_buffer[id].addr) == -1)
 			printf("Erreur lors de l'envoi du ACK\n");
 		// we send the ack without any test, since any error would result on the server sending again SYN_ACK and thus the client would ACK back
@@ -402,13 +420,14 @@ int mic_tcp_connect(int socket, mic_tcp_sock_addr addr)
 		__MIC_TCP_sock_buffer[id].state = CONNECTED;
 		break;
 	}
-	
+
 	if(__MIC_TCP_sock_buffer[id].state != CONNECTED)
 	{ // failed to connect
+		__MIC_TCP_sock_buffer[id].state = BOUND;
 		return -1;
 	}
 
-    return 0;
+	return 0;
 }
 
 /*
@@ -422,7 +441,7 @@ int mic_tcp_send (int mic_sock, char* mesg, int mesg_size)
 	int id = mic_tcp_get_id_from_fd(mic_sock);
 
 	if(id == -1)
-	{	
+	{
 		printf("erreur socket not found\n");
 		return -1;
 	}
@@ -585,7 +604,11 @@ void process_received_PDU(mic_tcp_pdu pdu, mic_tcp_sock_addr addr)
 		id_socket = 0;
 	}
 
-	if(pdu.header.ack != 1) // if it is not a ack pdu
+	if(pdu.header.syn == 1)
+	{
+		printf("ignoring syn received in process_received_PDU\n");
+	}
+	else if(pdu.header.ack != 1) // if it is not an ack pdu nor a syn
 	{
 		mic_tcp_header ack_header = mic_tcp_build_header(TCPMIC_ACK, pdu.header.seq_num, 0/*unused*/, __MIC_TCP_sock_buffer[id_socket].addr.port, __MIC_TCP_sock_buffer[id_socket].addr.port);
 		mic_tcp_pdu ack_pdu;
@@ -609,20 +632,25 @@ void process_received_PDU(mic_tcp_pdu pdu, mic_tcp_sock_addr addr)
 			if(pdu.header.seq_num == __MIC_TCP_sock_buffer[id_socket].n_seq)
 			{
 				app_buffer_put(pdu.payload);
-				printf("%s\n", pdu.payload.data);			
-				if(__MIC_TCP_sock_buffer[id_socket].n_seq == 0)
-				{
-					__MIC_TCP_sock_buffer[id_socket].n_seq = 1;
-				}
-				else
-				{
-					__MIC_TCP_sock_buffer[id_socket].n_seq = 0;
-				}
+				printf("%s\n", pdu.payload.data);	
+				__MIC_TCP_sock_buffer[id_socket].n_seq ^= 1;
 			}
 			else
 			{
 				printf("Mauvais numero de sequence\n");
 			}
+		}
+	}
+	else if(__MIC_TCP_sock_buffer[id_socket].state == WAIT_FOR_ACK)
+	{ // if we wait for an ack and receive an ack :
+		if(__MIC_TCP_sock_buffer[id_socket].n_seq == pdu.header.ack_num)
+		{
+			__MIC_TCP_sock_buffer[id_socket].n_seq ^= 1;
+			__MIC_TCP_sock_buffer[id_socket].state = CONNECTED;
+		}
+		else
+		{
+			printf("bad ack received\n");
 		}
 	}
 }

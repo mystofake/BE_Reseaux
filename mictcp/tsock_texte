@@ -27,14 +27,14 @@ fi
 
 if [ "$puits" = true ]; then
     cd build
-    ./server
+    valgrind ./server
     cd ..
 fi
 
 if [ "$sourc" = true ]; then
 
     cd build
-    ./client
+    valgrind ./client
     cd ..
 fi
 

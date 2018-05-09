@@ -96,7 +96,6 @@ int initialize_components(start_mode mode)
 
 int IP_send(mic_tcp_pdu pk, mic_tcp_sock_addr addr)
 {
-
     int result = 0;
 
     if(initialized == -1) {

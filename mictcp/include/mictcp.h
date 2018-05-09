@@ -21,7 +21,7 @@
 #define __TCPMIC_DEFAULT_SERVER_LOSS_RATE 0.2
 
 #define __TCPMIC_WAIT_ACK_TIME 50
-#define __TCPMIC_WAIT_CONNEXION_TICK 100
+#define __TCPMIC_WAIT_CONNEXION_TICK 500
 
 /*
  * Etats du protocole (les noms des états sont donnés à titre indicatif
@@ -29,7 +29,7 @@
  */
 typedef enum protocol_state
 {
-    IDLE, BOUND, WAIT_CONNEXION, WAIT_FOR_ACK, CONNECTED, CLOSED, SYN_SENT, SYN_RECEIVED, ESTABLISHED, CLOSING
+	IDLE, BOUND, WAIT_CONNEXION, WAIT_FOR_ACK, CONNECTED, CLOSED, SYN_SENT, SYN_RECEIVED, ESTABLISHED, CLOSING
 } protocol_state;
 
 /*
@@ -56,10 +56,12 @@ typedef struct mic_tcp_sock
 	int fd;  /* descripteur du socket */
 	protocol_state state; /* état du protocole */
 	mic_tcp_sock_addr addr; /* adresse du socket */
-    unsigned char n_seq;
-    int lastReceived[__TCPMIC_PDURECEIVEDBUFSIZE];
-    int lastReceivedSize;
-    int lastReceivedCurrent;
+	unsigned char n_seq;
+
+/* partial reliability fields */
+	int lastReceived[__TCPMIC_PDURECEIVEDBUFSIZE];
+	int lastReceivedSize;
+	int lastReceivedCurrent;
 } mic_tcp_sock;
 
 /*
