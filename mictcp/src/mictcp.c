@@ -1,6 +1,7 @@
 #include <mictcp.h>
 #include <api/mictcp_core.h>
 
+
 #define __TCPMIC_BUFSIZE 32
 #define __TCPMIC_MAXWAITLOOPSIZE 1024
 
@@ -362,7 +363,7 @@ int mic_tcp_connect(int socket, mic_tcp_sock_addr addr)
 		send_ret = IP_send(pdu_syn, __MIC_TCP_sock_buffer[id].addr);
 		__MIC_TCP_sock_buffer[id].state = SYN_SENT;
 
-		printf("Envoi du Syn\n");
+		printf("Sending Syn\n");
 		//print_PDU(pdu_syn);
 		if(send_ret == -1)
 		{ // if IP_send didn't send
@@ -385,7 +386,7 @@ int mic_tcp_connect(int socket, mic_tcp_sock_addr addr)
 			continue;
 		}
 
-		printf("Reception du SynACK\n");
+		printf("Receiving SynACK\n");
 		print_PDU(pdu_syn_ack);
 
 		__MIC_TCP_sock_buffer[id].n_seq = __MIC_TCP_sock_buffer[id].n_seq^1;
@@ -413,8 +414,7 @@ int mic_tcp_connect(int socket, mic_tcp_sock_addr addr)
 			printf("Erreur lors de l'envoi du ACK\n");
 		// we send the ack without any test, since any error would result on the server sending again SYN_ACK and thus the client would ACK back
 
-		printf("Envoi du ACK\n");
-		print_SOCKET(__MIC_TCP_sock_buffer[id],0);
+		printf("Sending ACK\n");
 		print_PDU(pdu_ack);
 		
 		__MIC_TCP_sock_buffer[id].state = CONNECTED;
@@ -581,7 +581,86 @@ int mic_tcp_recv (int socket, char* mesg, int max_mesg_size)
 int mic_tcp_close (int socket)
 {
     printf("[MIC-TCP] Appel de la fonction :  "); printf(__FUNCTION__); printf("\n");
-    return -1;
+
+	int id = mic_tcp_get_id_from_fd(socket);
+
+	if(id == -1)
+	{
+		return -1;
+	}
+
+	if(__MIC_TCP_sock_buffer[id].state != CONNECTED)
+	{
+		return -1;
+	}
+
+
+
+	mic_tcp_pdu pdu_fin;
+	pdu_fin.header = mic_tcp_build_header(TCPMIC_FIN, 0, __MIC_TCP_sock_buffer[id].n_seq, __MIC_TCP_sock_buffer[id].addr.port, __MIC_TCP_sock_buffer[id].addr.port);
+	pdu_fin.payload.size = 0;
+
+	mic_tcp_pdu pdu_fin_ack;
+	pdu_fin_ack.payload.size = 0;
+
+	mic_tcp_sock_addr fin_ack_addr;
+	
+	
+	int send_ret;
+	int i;
+
+	for(i=0;i<__TCPMIC_CLIENT_SEND_FIN_ATTEMPT;++i)
+	{
+		send_ret = IP_send(pdu_fin, __MIC_TCP_sock_buffer[id].addr);
+		__MIC_TCP_sock_buffer[id].state = FIN_SENT;
+
+		printf("Sending FIN\n");
+		//print_PDU(pdu_syn);
+		if(send_ret == -1)
+		{ // if IP_send didn't send
+			continue;
+		}
+
+		if((IP_recv(&pdu_fin_ack, &fin_ack_addr, __TCPMIC_WAIT_ACK_TIME) == -1))
+		{
+			continue;
+		}
+
+		if(pdu_fin_ack.header.fin != 1 || pdu_fin_ack.header.ack != 1)
+		{
+			printf("This is not a FINACK\n");
+			continue;
+		}
+
+		if(pdu_fin_ack.header.ack_num != pdu_fin.header.seq_num || pdu_fin_ack.header.seq_num != (pdu_fin_ack.header.ack_num^1))//|| pdu_fin_ack.header.seq_num != (pdu_fin_ack.header.ack_num^1))
+		{ // for some reason we received a bad FIN_ACK
+			continue;
+		}
+
+		printf("Receiving FINACK\n");
+		print_PDU(pdu_fin_ack);
+
+		__MIC_TCP_sock_buffer[id].state = CLOSING;
+		break;
+
+	}
+
+	if(__MIC_TCP_sock_buffer[id].state != CLOSING)
+	{
+		return(-1);
+	} 
+	else
+	{
+
+		//TO DO : Close the socket - Destroy structure...
+
+		return 0;
+
+	}
+	
+
+
+
 }
 
 /*
@@ -607,6 +686,18 @@ void process_received_PDU(mic_tcp_pdu pdu, mic_tcp_sock_addr addr)
 	if(pdu.header.syn == 1)
 	{
 		printf("ignoring syn received in process_received_PDU\n");
+	}
+	else if(pdu.header.fin == 1)
+	{
+		mic_tcp_header ack_header = mic_tcp_build_header(TCPMIC_ACK|TCPMIC_FIN, pdu.header.seq_num, 0/*unused*/, __MIC_TCP_sock_buffer[id_socket].addr.port, __MIC_TCP_sock_buffer[id_socket].addr.port);
+		mic_tcp_pdu ack_pdu;
+		ack_pdu.header = ack_header;
+		ack_pdu.payload.data = NULL;
+		ack_pdu.payload.size = 0;
+
+		IP_send(ack_pdu, addr);
+
+		//TO DO : clean socket + destroy structure
 	}
 	else if(pdu.header.ack != 1) // if it is not an ack pdu nor a syn
 	{
